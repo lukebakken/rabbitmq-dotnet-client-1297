@@ -1,4 +1,6 @@
 ﻿using System.Diagnostics;
+using System.Text;
+using System.Threading;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -8,7 +10,7 @@ var factory = new ConnectionFactory()
     VirtualHost = "/",
     UserName = "guest",
     Password = "guest",
-    ClientProvidedName = "TestClient",
+    ClientProvidedName = "gh-1297-TestClient",
     RequestedHeartbeat = TimeSpan.FromSeconds(10),
     AutomaticRecoveryEnabled = false,
     TopologyRecoveryEnabled = false,
@@ -20,6 +22,8 @@ IModel? channel = null;
 const string exchangeName = "gh-1297";
 const string queueName = "gh-1297-queue";
 
+var stopEvent = new ManualResetEventSlim();
+
 try
 {
     connection = factory.CreateConnection();
@@ -30,27 +34,22 @@ try
     connection.ConnectionUnblocked += OnConnectionUnblocked;
     connection.ConnectionUnblocked += OnConnectionShutdown;
 
-    DeclareEntities(channel, queueName, exchangeName);
+    DeclareEntities(channel);
 
-    Console.WriteLine($"[*] waiting for messages via routing key: {queueName}.");
-    var messageProcessor = new MessageProcessor();
-    messageProcessor.MessageReceived += (message) =>
+    var consumerTag = StartConsuming(channel);
+
+    Console.CancelKeyPress += (object? sender, ConsoleCancelEventArgs e) =>
     {
-        Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Sleeping {message}");
-        Thread.Sleep(30000);
-        Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Slept {message}");
+        Console.WriteLine("[INFO] CTRL-C pressed, exiting!");
+        stopEvent.Set();
+        e.Cancel = true;
     };
 
-    messageProcessor.StartReadingMessages(channel, queueName);
+    stopEvent.Wait();
 
-    bool stop = false;
-
-    Console.WriteLine(" Press [enter] to exit.");
-    Console.CancelKeyPress += (sender, e) =>
-    {
-        stop = true;
-    };
-
+    Console.WriteLine("[INFO] cancelling consumer on exit...");
+    channel.BasicCancel(consumerTag);
+    /*
     while (!stop)
     {
         if (connection.IsOpen && !channel.IsOpen)
@@ -64,19 +63,21 @@ try
         else
             Thread.Sleep(2000);
     }
+    */
 }
 finally
 {
+    Console.WriteLine("[INFO] disposing resources on exit...");
     channel?.Close();
     channel?.Dispose();
     connection?.Close();
     connection?.Dispose();
 }
 
-static void DeclareEntities(IModel channel, string exchangeName, string queueName)
+void DeclareEntities(IModel channel)
 {
     channel.ExchangeDeclare(exchange: exchangeName, type: ExchangeType.Direct, durable: true);
-    channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false);
+    channel.QueueDeclare(queue: queueName, durable: true, exclusive: false, autoDelete: false);
     channel.QueueBind(queue: queueName, exchange: exchangeName, routingKey: queueName);
 }
 
@@ -95,32 +96,32 @@ IModel CreateModel(IConnection connection)
 
 void OnConnectionShutdown(object? sender, EventArgs e)
 {
-    Console.WriteLine("Connection shutdown");
+    Console.WriteLine("[INFO] connection shutdown");
 }
 
 void OnConnectionUnblocked(object? sender, EventArgs e)
 {
-    Console.WriteLine("Connection unblocked");
+    Console.WriteLine("[INFO] connection unblocked");
 }
 
 void OnConnectionBlocked(object? sender, ConnectionBlockedEventArgs e)
 {
-    Console.WriteLine($"Connection blocked. Is open? {connection.IsOpen}");
+    Console.WriteLine($"[INFO] connection blocked, IsOpen: {connection.IsOpen}");
 }
 
 void OnConnectionCallbackException(object? sender, CallbackExceptionEventArgs e)
 {
-    Console.WriteLine($"Connection callback exception: {e.Exception.Message}");
+    Console.Error.WriteLine($"[ERROR] connection callback exception: {e.Exception.Message}");
 }
 
 void OnModelShutdown(object? sender, ShutdownEventArgs e)
 {
-    Console.WriteLine($"Channel shutdown: {e.ReplyCode} - {e.ReplyText}");
+    Console.WriteLine($"[INFO] channel shutdown: {e.ReplyCode} - {e.ReplyText}");
 }
 
 void OnModelCallbackException(object? sender, CallbackExceptionEventArgs e)
 {
-    Console.WriteLine($"Channel callback exception: {e.Exception.Message}");
+    Console.Error.WriteLine($"[ERROR] channel callback exception: {e.Exception.Message}");
 }
 
 void OnModelBasicAcks(object? sender, BasicAckEventArgs e)
@@ -143,61 +144,63 @@ void OnModelFlowControl(object? sender, FlowControlEventArgs e)
     Console.WriteLine($"Channel saw flow control, active: {e.Active}");
 }
 
-void StartConsuming(IModel channel, string queueName)
+string StartConsuming(IModel channel)
 {
-    Console.WriteLine("[INFO} consumer is starting");
+    ulong lastDeliveryTag = 0;
+
+    Console.WriteLine($"[INFO] consumer is starting, queueName: {queueName}");
     var consumer = new EventingBasicConsumer(channel);
-    Stopwatch sw = new Stopwatch();
-    consumer.Received += (model, ea) =>
+    consumer.Received += (sender, ea) =>
     {
-        if (ea.DeliveryTag <= lastsequence)
-            Console.WriteLine("OUT OF ORDER");
-        else
+        if (stopEvent.IsSet)
         {
-            if (model is not EventingBasicConsumer consumer)
-                return;
-            var myChannel = consumer.Model;
-            lastsequence = ea.DeliveryTag;
-            Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Received message {lastsequence} redelivered {ea.Redelivered}");
-            sw.Restart();
-            var message = Encoding.UTF8.GetString(ea.Body.Span);
-            OnMessageReceived(message);
-            //Console.WriteLine($"Message {message} readed. Press key to nack");
-            //Console.ReadKey();
-            //channel.BasicNack(ea.DeliveryTag, false, true);
-            try
-            {
-                if (myChannel.IsOpen)
-                {
-                    myChannel.BasicAck(ea.DeliveryTag, false);
-                    Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Confirmed message {lastsequence}");
-                }
-            }
-            catch(Exception ex) { Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Error confirming message {lastsequence}"); }
+            Console.WriteLine("[WARNING] consumer received message while cancellation requested!");
         }
 
+        if (ea.DeliveryTag <= lastDeliveryTag)
+        {
+            Console.Error.WriteLine("[ERROR] OUT OF ORDER");
+        }
+        else
+        {
+            Debug.Assert(Object.ReferenceEquals(sender, consumer));
+            Debug.Assert(Object.ReferenceEquals(channel, consumer.Model));
+
+            lastDeliveryTag = ea.DeliveryTag;
+            Console.WriteLine($"[INFO] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] consumed message, deliveryTag: {lastDeliveryTag}, redelivered: {ea.Redelivered}");
+            try
+            {
+                var ch = consumer.Model;
+                ch.BasicAck(ea.DeliveryTag, false);
+                Console.WriteLine($"[INFO] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] acked message {lastDeliveryTag}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[ERROR] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Error confirming message {lastDeliveryTag}, ex: {ex.Message}");
+            }
+        }
     };
 
-    channel.BasicConsume(queue: queue,
-                            autoAck: false,
-                            consumer: consumer);
+    consumer.Unregistered += OnConsumerUnregistered;
+    consumer.ConsumerCancelled += OnConsumerCancelled;
+    consumer.Shutdown += OnConsumerShutdown;
 
-    consumer.Unregistered += UnregisteredAsync;
-    consumer.ConsumerCancelled += Cancelled;
-    consumer.Shutdown += Shutdown;
+    var consumerTag = channel.BasicConsume(queue: queueName, autoAck: false, consumer: consumer);
+    Console.WriteLine($"[INFO] consumer started, consumerTag: {consumerTag}");
+    return consumerTag;
 }
 
-private void UnregisteredAsync(object? sender, ConsumerEventArgs @event)
+void OnConsumerUnregistered(object? sender, ConsumerEventArgs e)
 {
-    Console.WriteLine("Consumer unregistered");
+    Console.WriteLine($"[INFO] consumer unregistered, consumer tag: {e.ConsumerTags[0]}");
 }
 
-private void Shutdown(object? sender, ShutdownEventArgs e)
+void OnConsumerCancelled(object? sender, ConsumerEventArgs e)
 {
-    Console.WriteLine("Consumer shutdown");
+    Console.WriteLine($"[INFO] consumer cancelled, consumer tag: {e.ConsumerTags[0]}");
 }
 
-private void Cancelled(object? sender, ConsumerEventArgs e)
+void OnConsumerShutdown(object? sender, ShutdownEventArgs e)
 {
-    Console.WriteLine("Consumer cancelled");
+    Console.WriteLine($"[INFO] consumer shutdown {e.ReplyCode} - {e.ReplyText}");
 }
