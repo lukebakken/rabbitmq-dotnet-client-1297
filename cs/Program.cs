@@ -10,38 +10,19 @@ var factory = new ConnectionFactory()
     UserName = "guest",
     Password = "guest",
     ClientProvidedName = "TestClient",
-    //Port = 443,
     RequestedHeartbeat = TimeSpan.FromSeconds(10),
     AutomaticRecoveryEnabled = false,
     TopologyRecoveryEnabled = false,
 };
 
-/*
-factory.Ssl.Enabled = true;
-factory.Ssl.ServerName = factory.HostName;
-factory.Ssl.Version = System.Security.Authentication.SslProtocols.Tls12;
-factory.Ssl.AcceptablePolicyErrors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
-factory.Ssl.AcceptablePolicyErrors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
-*/
-
-/*
-if (!string.IsNullOrEmpty(config.CertificateFilePath))
-{
-    factory.Ssl.CertPath = config.CertificateFilePath;
-    factory.Ssl.CertPassphrase = config.CertificatePassphrase;
-}
-*/
-
-IConnection connection = null;
-IModel channel = null;
+IConnection? connection = null;
+IModel? channel = null;
 
 try
 {
-    //factory.DispatchConsumersAsync = true;
     connection = factory.CreateConnection();
     channel = connection.CreateModel();
 
-    //channel.BasicQos(0, args.Any() ? ushort.Parse(args[0]) : (ushort)10, false);
     channel.BasicQos(0, 2, false);
 
     connection.CallbackException += callBackException;
@@ -49,20 +30,13 @@ try
     connection.ConnectionUnblocked += connectionUnblocked;
     connection.ConnectionUnblocked += connectionShutdown;
 
-    channel.ExchangeDeclare(exchange: "DomExchange",
-        type: ExchangeType.Topic, durable: true);
+    channel.ExchangeDeclare(exchange: "DomExchange", type: ExchangeType.Topic, durable: true);
 
     var queueName = "quorum-test";
 
     string routingKey = "quorum";
 
-    var arguments = new Dictionary<string, object> {
-    { "x-queue-type", "quorum" },
-    /*{ "x-message-ttl", 10000 },
-    { "x-dead-letter-exchange", "ERP3.DLX" },
-    { "x-dead-letter-strategy", "at-least-once" },
-    { "x-overflow", "reject-publish" },*/
-};
+    var arguments = new Dictionary<string, object> { { "x-queue-type", "quorum" } };
 
     channel.ModelShutdown += OnShutdown;
 
@@ -144,15 +118,6 @@ void OnShutdown(object? sender, ShutdownEventArgs e)
     Console.WriteLine($"Channel shutdown {e.ReplyCode} - {e.ReplyText}");
     if (e.ReplyCode == RabbitMQ.Client.Constants.ReplySuccess)
         return;
-
-    try
-    {
-        //ch
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine(ex.Message);
-    }
 }
 
 static string DeclareQueues(IModel channel , Dictionary<string, object> arguments, List<string> nodes, List<string> erps)
