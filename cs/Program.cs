@@ -21,9 +21,15 @@ IModel? channel = null;
 const string exchangeName = "gh-1297";
 const string queueName = "gh-1297-queue";
 
+bool stopping = false;
 var r = new Random();
 var timers = new Dictionary<ulong, System.Timers.Timer>();
 var stopEvent = new ManualResetEventSlim();
+var channelShutdownEvent = new ManualResetEventSlim();
+
+var handles = new WaitHandle[2];
+handles[0] = stopEvent.WaitHandle;
+handles[1] = channelShutdownEvent.WaitHandle;
 
 try
 {
@@ -46,10 +52,26 @@ try
         e.Cancel = true;
     };
 
-    stopEvent.Wait();
-
-    Console.WriteLine("[INFO] cancelling consumer on exit...");
-    channel.BasicCancel(consumerTag);
+    while (!stopping)
+    {
+        int i = WaitHandle.WaitAny(handles);
+        switch (i)
+        {
+            case 0:
+                // stopEvent was set
+                stopping = true;
+                break;
+            case 1:
+                // channelShutdown was set
+                Console.WriteLine("[INFO] re-starting channel and consumer...");
+                channel = CreateModel(connection);
+                DeclareEntities(channel);
+                consumerTag = StartConsuming(channel);
+                break;
+            default:
+                continue;
+        }
+    }
 }
 finally
 {
@@ -70,6 +92,7 @@ void DeclareEntities(IModel channel)
 
 IModel CreateModel(IConnection connection)
 {
+    channelShutdownEvent.Reset();
     var ch = connection.CreateModel();
     ch.BasicQos(0, 5, false);
     ch.ModelShutdown += OnModelShutdown;
@@ -122,11 +145,8 @@ void OnConnectionCallbackException(object? sender, CallbackExceptionEventArgs e)
 void OnModelShutdown(object? sender, ShutdownEventArgs e)
 {
     Console.WriteLine($"[INFO] channel shutdown: {e.ReplyCode} - {e.ReplyText}");
-    if (e.ReplyCode == 406)
-    {
-        StopTimers();
-        // Consumer ack timed out
-    }
+    StopTimers();
+    channelShutdownEvent.Set();
 }
 
 void OnModelCallbackException(object? sender, CallbackExceptionEventArgs e)
@@ -165,6 +185,7 @@ string StartConsuming(IModel channel)
         if (stopEvent.IsSet)
         {
             Console.Error.WriteLine("[WARNING] consumer received message while cancellation requested!");
+            channel.BasicCancel(consumer.ConsumerTags[0]);
         }
 
         if (ea.DeliveryTag <= lastDeliveryTag)
