@@ -186,6 +186,7 @@ string StartConsuming(IModel channel)
         {
             Console.Error.WriteLine("[WARNING] consumer received message while cancellation requested!");
             channel.BasicCancel(consumer.ConsumerTags[0]);
+            return;
         }
 
         if (ea.DeliveryTag <= lastDeliveryTag)
