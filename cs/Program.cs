@@ -1,5 +1,4 @@
-﻿
-using ConsoleApp4;
+﻿using System.Diagnostics;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -18,49 +17,32 @@ var factory = new ConnectionFactory()
 IConnection? connection = null;
 IModel? channel = null;
 
+const string exchangeName = "gh-1297";
+const string queueName = "gh-1297-queue";
+
 try
 {
     connection = factory.CreateConnection();
-    channel = connection.CreateModel();
+    channel = CreateModel(connection);
 
-    channel.BasicQos(0, 2, false);
+    connection.CallbackException += OnConnectionCallbackException;
+    connection.ConnectionBlocked += OnConnectionBlocked;
+    connection.ConnectionUnblocked += OnConnectionUnblocked;
+    connection.ConnectionUnblocked += OnConnectionShutdown;
 
-    connection.CallbackException += callBackException;
-    connection.ConnectionBlocked += connectionBlocked;
-    connection.ConnectionUnblocked += connectionUnblocked;
-    connection.ConnectionUnblocked += connectionShutdown;
+    DeclareEntities(channel, queueName, exchangeName);
 
-    channel.ExchangeDeclare(exchange: "DomExchange", type: ExchangeType.Topic, durable: true);
-
-    var queueName = "quorum-test";
-
-    string routingKey = "quorum";
-
-    var arguments = new Dictionary<string, object> { { "x-queue-type", "quorum" } };
-
-    channel.ModelShutdown += OnShutdown;
-
-    var nodes = new List<string>();
-    var erps = new List<string>();
-
-    int numNodes = 1;
-    int numErps = 1;
-
-    for (int i = 0; i < numNodes; i++)
+    Console.WriteLine($"[*] waiting for messages via routing key: {queueName}.");
+    var messageProcessor = new MessageProcessor();
+    messageProcessor.MessageReceived += (message) =>
     {
-        nodes.Add($"Node{i}");
-    }
+        Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Sleeping {message}");
+        Thread.Sleep(30000);
+        Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Slept {message}");
+    };
 
-    for (int i = 0; i < numErps; i++)
-    {
-        erps.Add($"Erp{i}");
-    }
+    messageProcessor.StartReadingMessages(channel, queueName);
 
-    queueName = DeclareQueues(channel, arguments, nodes, erps);
-
-    Console.WriteLine($"[*] Waiting for All in route {routingKey}.");
-
-    StartMessageProcessor(channel, queueName);
     bool stop = false;
 
     Console.WriteLine(" Press [enter] to exit.");
@@ -75,11 +57,9 @@ try
         {
             channel.Close();
             channel.Dispose();
-            var myChannel = connection.CreateModel();
-            myChannel.BasicQos(0, 2, false);
-            myChannel.ModelShutdown += OnShutdown;
-            DeclareQueues(myChannel, arguments, nodes, erps);
-            StartMessageProcessor(myChannel, queueName);
+            channel = CreateModel(connection);
+            DeclareEntities(channel, queueName, exchangeName);
+            // TODO re-start consumer
         }
         else
             Thread.Sleep(2000);
@@ -93,87 +73,131 @@ finally
     connection?.Dispose();
 }
 
-void connectionShutdown(object? sender, EventArgs e)
+static void DeclareEntities(IModel channel, string exchangeName, string queueName)
+{
+    channel.ExchangeDeclare(exchange: exchangeName, type: ExchangeType.Direct, durable: true);
+    channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false);
+    channel.QueueBind(queue: queueName, exchange: exchangeName, routingKey: queueName);
+}
+
+IModel CreateModel(IConnection connection)
+{
+    var ch = connection.CreateModel();
+    ch.BasicQos(0, 2, false);
+    ch.ModelShutdown += OnModelShutdown;
+    ch.CallbackException += OnModelCallbackException;
+    ch.BasicAcks += OnModelBasicAcks;
+    ch.BasicNacks += OnModelBasicNacks;
+    ch.BasicReturn += OnModelBasicReturn;
+    ch.FlowControl += OnModelFlowControl;
+    return ch;
+}
+
+void OnConnectionShutdown(object? sender, EventArgs e)
 {
     Console.WriteLine("Connection shutdown");
 }
 
-void connectionUnblocked(object? sender, EventArgs e)
+void OnConnectionUnblocked(object? sender, EventArgs e)
 {
     Console.WriteLine("Connection unblocked");
 }
 
-void connectionBlocked(object? sender, ConnectionBlockedEventArgs e)
+void OnConnectionBlocked(object? sender, ConnectionBlockedEventArgs e)
 {
     Console.WriteLine($"Connection blocked. Is open? {connection.IsOpen}");
 }
 
-void callBackException(object? sender, CallbackExceptionEventArgs e)
+void OnConnectionCallbackException(object? sender, CallbackExceptionEventArgs e)
 {
-    Console.WriteLine($"Callback exception {e.Exception.Message}");
+    Console.WriteLine($"Connection callback exception: {e.Exception.Message}");
 }
 
-void OnShutdown(object? sender, ShutdownEventArgs e)
+void OnModelShutdown(object? sender, ShutdownEventArgs e)
 {
-    Console.WriteLine($"Channel shutdown {e.ReplyCode} - {e.ReplyText}");
-    if (e.ReplyCode == RabbitMQ.Client.Constants.ReplySuccess)
-        return;
+    Console.WriteLine($"Channel shutdown: {e.ReplyCode} - {e.ReplyText}");
 }
 
-static string DeclareQueues(IModel channel , Dictionary<string, object> arguments, List<string> nodes, List<string> erps)
+void OnModelCallbackException(object? sender, CallbackExceptionEventArgs e)
 {
-    string queueName = string.Empty;
-    foreach (var erp in erps)
+    Console.WriteLine($"Channel callback exception: {e.Exception.Message}");
+}
+
+void OnModelBasicAcks(object? sender, BasicAckEventArgs e)
+{
+    Console.WriteLine($"Channel saw basic.ack, delivery tag: {e.DeliveryTag} multiple: {e.Multiple}");
+}
+
+void OnModelBasicNacks(object? sender, BasicNackEventArgs e)
+{
+    Console.WriteLine($"Channel saw basic.nack, delivery tag: {e.DeliveryTag} multiple: {e.Multiple}");
+}
+
+void OnModelBasicReturn(object? sender, BasicReturnEventArgs e)
+{
+    Console.WriteLine($"Channel saw basic.return {e.ReplyCode} - {e.ReplyText}");
+}
+
+void OnModelFlowControl(object? sender, FlowControlEventArgs e)
+{
+    Console.WriteLine($"Channel saw flow control, active: {e.Active}");
+}
+
+void StartConsuming(IModel channel, string queueName)
+{
+    Console.WriteLine("[INFO} consumer is starting");
+    var consumer = new EventingBasicConsumer(channel);
+    Stopwatch sw = new Stopwatch();
+    consumer.Received += (model, ea) =>
     {
-        // DOM -> ERP
-        queueName = $"DOM-{erp}";
-        channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false, arguments);
-        channel.QueueBind(queue: queueName, exchange: "DomExchange", routingKey: $"DOM.{erp}.*");
-
-        // ERP -> DOM
-        queueName = $"{erp}-DOM";
-        channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false, arguments);
-        channel.QueueBind(queue: queueName, exchange: "DomExchange", routingKey: $"{erp}.*");
-    }
-
-    foreach (var node in nodes)
-    {
-        // DOM -> Node
-        queueName = $"DOM-{node}";
-        channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false, arguments);
-        channel.QueueBind(queue: queueName, exchange: "DomExchange", routingKey: $"DOM.{node}.*");
-
-        // Node -> DOM
-        queueName = $"{node}-DOM";
-        channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false, arguments);
-        channel.QueueBind(queue: queueName, exchange: "DomExchange", routingKey: $"{node}.DOM");
-
-        foreach (var erp in erps)
+        if (ea.DeliveryTag <= lastsequence)
+            Console.WriteLine("OUT OF ORDER");
+        else
         {
-            // ERP -> Node
-            queueName = $"{erp}-{node}";
-            channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false, arguments);
-            channel.QueueBind(queue: queueName, exchange: "DomExchange", routingKey: $"{erp}.ALL");
-
-            // Node -> ERP
-            queueName = $"{node}-{erp}";
-            channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false, arguments);
-            channel.QueueBind(queue: queueName, exchange: "DomExchange", routingKey: $"{node}.{erp}");
+            if (model is not EventingBasicConsumer consumer)
+                return;
+            var myChannel = consumer.Model;
+            lastsequence = ea.DeliveryTag;
+            Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Received message {lastsequence} redelivered {ea.Redelivered}");
+            sw.Restart();
+            var message = Encoding.UTF8.GetString(ea.Body.Span);
+            OnMessageReceived(message);
+            //Console.WriteLine($"Message {message} readed. Press key to nack");
+            //Console.ReadKey();
+            //channel.BasicNack(ea.DeliveryTag, false, true);
+            try
+            {
+                if (myChannel.IsOpen)
+                {
+                    myChannel.BasicAck(ea.DeliveryTag, false);
+                    Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Confirmed message {lastsequence}");
+                }
+            }
+            catch(Exception ex) { Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Error confirming message {lastsequence}"); }
         }
-    }
 
-    return queueName;
-}
-
-static void StartMessageProcessor(IModel channel, string queueName)
-{
-    var messageProcessor = new MessageProcessor();
-    messageProcessor.MessageReceived += (message) =>
-    {
-        Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Sleeping {message}");
-        Thread.Sleep(30000);
-        Console.WriteLine($"[{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Slept {message}");
     };
 
-    messageProcessor.StartReadingMessages(channel, queueName);
+    channel.BasicConsume(queue: queue,
+                            autoAck: false,
+                            consumer: consumer);
+
+    consumer.Unregistered += UnregisteredAsync;
+    consumer.ConsumerCancelled += Cancelled;
+    consumer.Shutdown += Shutdown;
+}
+
+private void UnregisteredAsync(object? sender, ConsumerEventArgs @event)
+{
+    Console.WriteLine("Consumer unregistered");
+}
+
+private void Shutdown(object? sender, ShutdownEventArgs e)
+{
+    Console.WriteLine("Consumer shutdown");
+}
+
+private void Cancelled(object? sender, ConsumerEventArgs e)
+{
+    Console.WriteLine("Consumer cancelled");
 }
