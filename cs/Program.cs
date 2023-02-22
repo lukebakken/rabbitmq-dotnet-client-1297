@@ -1,6 +1,5 @@
 ﻿using System.Diagnostics;
-using System.Text;
-using System.Threading;
+using System.Timers;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -22,6 +21,8 @@ IModel? channel = null;
 const string exchangeName = "gh-1297";
 const string queueName = "gh-1297-queue";
 
+var r = new Random();
+var timers = new Dictionary<ulong, System.Timers.Timer>();
 var stopEvent = new ManualResetEventSlim();
 
 try
@@ -49,25 +50,11 @@ try
 
     Console.WriteLine("[INFO] cancelling consumer on exit...");
     channel.BasicCancel(consumerTag);
-    /*
-    while (!stop)
-    {
-        if (connection.IsOpen && !channel.IsOpen)
-        {
-            channel.Close();
-            channel.Dispose();
-            channel = CreateModel(connection);
-            DeclareEntities(channel, queueName, exchangeName);
-            // TODO re-start consumer
-        }
-        else
-            Thread.Sleep(2000);
-    }
-    */
 }
 finally
 {
     Console.WriteLine("[INFO] disposing resources on exit...");
+    StopTimers();
     channel?.Close();
     channel?.Dispose();
     connection?.Close();
@@ -84,7 +71,7 @@ void DeclareEntities(IModel channel)
 IModel CreateModel(IConnection connection)
 {
     var ch = connection.CreateModel();
-    ch.BasicQos(0, 2, false);
+    ch.BasicQos(0, 5, false);
     ch.ModelShutdown += OnModelShutdown;
     ch.CallbackException += OnModelCallbackException;
     ch.BasicAcks += OnModelBasicAcks;
@@ -92,6 +79,24 @@ IModel CreateModel(IConnection connection)
     ch.BasicReturn += OnModelBasicReturn;
     ch.FlowControl += OnModelFlowControl;
     return ch;
+}
+
+void StopTimers()
+{
+    if (timers is null)
+    {
+        Console.Error.WriteLine("[WARNING] timers dict is null, huh?");
+    }
+    else
+    {
+        foreach (KeyValuePair<ulong, System.Timers.Timer> e in timers)
+        {
+            var t = e.Value;
+            t.Enabled = false;
+            t.Dispose();
+        }
+        timers.Clear();
+    }
 }
 
 void OnConnectionShutdown(object? sender, EventArgs e)
@@ -117,6 +122,11 @@ void OnConnectionCallbackException(object? sender, CallbackExceptionEventArgs e)
 void OnModelShutdown(object? sender, ShutdownEventArgs e)
 {
     Console.WriteLine($"[INFO] channel shutdown: {e.ReplyCode} - {e.ReplyText}");
+    if (e.ReplyCode == 406)
+    {
+        StopTimers();
+        // Consumer ack timed out
+    }
 }
 
 void OnModelCallbackException(object? sender, CallbackExceptionEventArgs e)
@@ -150,11 +160,11 @@ string StartConsuming(IModel channel)
 
     Console.WriteLine($"[INFO] consumer is starting, queueName: {queueName}");
     var consumer = new EventingBasicConsumer(channel);
-    consumer.Received += (sender, ea) =>
+    consumer.Received += (objConsumer, ea) =>
     {
         if (stopEvent.IsSet)
         {
-            Console.WriteLine("[WARNING] consumer received message while cancellation requested!");
+            Console.Error.WriteLine("[WARNING] consumer received message while cancellation requested!");
         }
 
         if (ea.DeliveryTag <= lastDeliveryTag)
@@ -163,21 +173,43 @@ string StartConsuming(IModel channel)
         }
         else
         {
-            Debug.Assert(Object.ReferenceEquals(sender, consumer));
+            Debug.Assert(Object.ReferenceEquals(objConsumer, consumer));
             Debug.Assert(Object.ReferenceEquals(channel, consumer.Model));
 
             lastDeliveryTag = ea.DeliveryTag;
             Console.WriteLine($"[INFO] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] consumed message, deliveryTag: {lastDeliveryTag}, redelivered: {ea.Redelivered}");
-            try
+
+            var timer = new System.Timers.Timer(r.Next(1000, 10000));
+            timer.Elapsed += (object? objTimer, ElapsedEventArgs e) =>
             {
-                var ch = consumer.Model;
-                ch.BasicAck(ea.DeliveryTag, false);
-                Console.WriteLine($"[INFO] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] acked message {lastDeliveryTag}");
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[ERROR] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Error confirming message {lastDeliveryTag}, ex: {ex.Message}");
-            }
+                ulong dt = ea.DeliveryTag;
+                var t = (System.Timers.Timer?)objTimer;
+                if (t is not null)
+                {
+                    try
+                    {
+                        t.Enabled = false;
+                        try
+                        {
+                            var c = (EventingBasicConsumer)objConsumer;
+                            c.Model.BasicAck(dt, false);
+                            Console.WriteLine($"[INFO] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] acked message {dt}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"[ERROR] [{Thread.CurrentThread.ManagedThreadId}][{DateTime.Now:HH:mm:ss.fff}] Error confirming message {dt}, ex: {ex.Message}");
+                        }
+                    }
+                    finally
+                    {
+                        timers.Remove(dt);
+                        t.Dispose();
+                    }
+                }
+            };
+            timer.Enabled = true;
+            timer.AutoReset = false;
+            timers.Add(ea.DeliveryTag, timer);
         }
     };
 
